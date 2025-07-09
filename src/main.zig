@@ -22,7 +22,11 @@ pub fn main() !void {
         .bg => |argv| try bg(alloc, argv),
         .kill => |id| try kill(alloc, id),
         .help => {
-            std.debug.print("usage: sc [server|fg|bg|kill]\n", .{});
+            std.debug.print(
+                \\sc - simple command (v0.0.0)
+                \\usage: sc [server|fg|bg|kill]
+                \\
+            , .{});
             return;
         },
     }
@@ -32,6 +36,8 @@ pub fn main() !void {
 fn fg(alloc: std.mem.Allocator, id: usize) !void {
     _ = alloc;
 
+    _ = @panic("TODO");
+
     var stream = try std.net.connectUnixSocket(rpc.SOCKET);
     defer stream.close();
 
@@ -40,15 +46,14 @@ fn fg(alloc: std.mem.Allocator, id: usize) !void {
     const stdin = std.io.getStdIn();
     const stdout = std.io.getStdOut();
 
-    var term_settings: sys.termios = undefined;
-    _ = sys.tcgetattr(stdin.handle, &term_settings);
+    var term_settings: std.os.linux.termios = undefined;
+    _ = std.os.linux.tcgetattr(stdin.handle, &term_settings);
 
     var raw_settings = term_settings;
     sys.cfmakeraw(&raw_settings);
 
-    // TODO the TCSA.NOW might be broken
-    _ = sys.tcsetattr(stdin.handle, @intFromEnum(std.posix.TCSA.NOW), &raw_settings);
-    defer _ = sys.tcsetattr(stdin.handle, @intFromEnum(std.posix.TCSA.NOW), &term_settings);
+    _ = std.os.linux.tcsetattr(stdin.handle, std.posix.TCSA.NOW, &raw_settings);
+    defer _ = std.os.linux.tcsetattr(stdin.handle, std.posix.TCSA.NOW, &term_settings);
 
     var fds = [_]std.posix.pollfd{
         .{
@@ -70,9 +75,13 @@ fn fg(alloc: std.mem.Allocator, id: usize) !void {
             if (n == 0) break;
             _ = stdout.writer().writeAll(buf[0..n]) catch break;
         }
+
         if (fds[1].revents == std.posix.POLL.IN) {
             const n = std.io.getStdIn().read(&buf) catch break;
             if (n == 0) break;
+            for (buf[0..n]) |c| {
+                if (c == 'q') break;
+            }
             _ = stream.writer().writeAll(buf[0..n]) catch break;
         }
     }

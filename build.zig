@@ -10,12 +10,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    screen.link_libc = true;
-
-    const exe = b.addExecutable(.{
-        .name = "screen",
-        .root_module = screen,
-    });
+    const exe = b.addExecutable(.{ .name = "sc", .root_module = screen });
     b.installArtifact(exe);
 
     // ------------------------------------------------------------------------

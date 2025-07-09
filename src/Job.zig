@@ -38,7 +38,7 @@ pub fn start(alloc: std.mem.Allocator, argv: []const []const u8) !Job {
 
     const pid = try std.posix.fork();
     if (pid == 0) {
-        _ = sys.setsid();
+        _ = std.os.linux.setsid();
         _ = std.os.linux.ioctl(slave, std.os.linux.T.IOCSCTTY, 0);
 
         try std.posix.dup2(slave, 0);
@@ -69,7 +69,10 @@ pub fn read(self: *Job, buf: []u8) !usize {
     if (!self.isrunning) return error.JobNotRunning;
     if (!self.fdopen) return error.JobNotRunning;
 
-    const n = std.c.read(self.ptyfd, buf.ptr, buf.len);
+    // cant use std.posix.read() as it doesnt handle pipe errors correctly i think
+    const e = std.os.linux.read(self.ptyfd, buf.ptr, buf.len);
+    const n: isize = @bitCast(e);
+
     if (n == -1) return 0;
     if (n < 0) return error.ReadFailed;
     return @intCast(n);
