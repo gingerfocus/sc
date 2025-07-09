@@ -1,103 +1,179 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("pty.h");
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("sys/ioctl.h");
-    @cInclude("sys/wait.h");
-});
 
-const Job = struct {
-    fd: c_int,
-    pid: c_int,
-    name: []const u8,
-    alloc: std.mem.Allocator,
-
-    pub fn start(
-        alloc: std.mem.Allocator,
-        // argv: [:null]const ?[*:0]const u8,
-        argv: []const []const u8,
-    ) !Job {
-        var master: c_int = undefined;
-        var slave: c_int = undefined;
-        var name_buf: [64]u8 = undefined;
-
-        if (c.openpty(&master, &slave, &name_buf, null, null) != 0)
-            return error.OpenPTYFailed;
-
-        const nameslice = std.mem.span(@as([*:0]const u8, @ptrCast(&name_buf)));
-        const name = alloc.dupe(u8, nameslice) catch |err| {
-            std.posix.close(master);
-            std.posix.close(slave);
-            return err;
-        };
-
-        const pid = c.fork();
-        if (pid == 0) {
-            // Child process
-            _ = c.setsid();
-            _ = c.ioctl(slave, c.TIOCSCTTY, @as(c_int, 0));
-
-            _ = c.dup2(slave, 0);
-            _ = c.dup2(slave, 1);
-            _ = c.dup2(slave, 2);
-
-            _ = c.close(master);
-            _ = c.close(slave);
-
-            const err = std.process.execv(alloc, argv);
-            std.debug.print("exec failed: {s}\n", .{@errorName(err)});
-            std.posix.exit(1);
-        }
-        if (pid < 0) return error.ForkFailed;
-
-        std.debug.assert(pid > 0);
-
-        // Parent process
-        std.posix.close(slave);
-
-        return Job{
-            .fd = master,
-            .pid = pid,
-            .name = name,
-            .alloc = alloc,
-        };
-    }
-
-    pub fn read(self: *Job, buf: []u8) !usize {
-        // cant use posix.read as it doesnt handle below error correctly
-
-        const n = std.c.read(self.fd, buf.ptr, buf.len);
-
-        // I dont know why, but sometimes read returns -1 when child process
-        // exits
-        if (n == -1) return 0;
-
-        if (n < 0) return error.ReadFailed;
-
-        return @intCast(n);
-    }
-
-    pub fn deinit(self: *Job) void {
-        self.alloc.free(self.name);
-        _ = c.close(self.fd);
-        _ = c.waitpid(self.pid, null, 0);
-    }
-};
+const Server = @import("Server.zig");
+const rpc = @import("rpc.zig");
+const sys = @import("sys.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const argv = [_][]const u8{ "/bin/sh", "-c", "echo hello world 2" };
-    var job = try Job.start(alloc, &argv);
-    defer job.deinit();
+    const args = try Args.init(alloc);
+    defer args.deinit(alloc);
 
-    while (true) {
-        var buf: [1024]u8 = undefined;
-        const n = try job.read(&buf);
-        if (n == 0) break;
-        _ = try std.io.getStdOut().writeAll(buf[0..n]);
+    switch (args) {
+        .server => {
+            var server = try Server.init(alloc);
+            defer server.deinit();
+            try server.run();
+        },
+        .fg => |id| try fg(alloc, id),
+        .bg => |argv| try bg(alloc, argv),
+        .kill => |id| try kill(alloc, id),
+        .help => {
+            std.debug.print("usage: sc [server|fg|bg|kill]\n", .{});
+            return;
+        },
     }
 }
+
+/// Bring a job to the foreground for the current shell.
+fn fg(alloc: std.mem.Allocator, id: usize) !void {
+    _ = alloc;
+
+    var stream = try std.net.connectUnixSocket(rpc.SOCKET);
+    defer stream.close();
+
+    try std.json.stringify(rpc.ServerMsg{ .fg = id }, .{}, stream.writer());
+
+    const stdin = std.io.getStdIn();
+    const stdout = std.io.getStdOut();
+
+    var term_settings: sys.termios = undefined;
+    _ = sys.tcgetattr(stdin.handle, &term_settings);
+
+    var raw_settings = term_settings;
+    sys.cfmakeraw(&raw_settings);
+
+    // TODO the TCSA.NOW might be broken
+    _ = sys.tcsetattr(stdin.handle, @intFromEnum(std.posix.TCSA.NOW), &raw_settings);
+    defer _ = sys.tcsetattr(stdin.handle, @intFromEnum(std.posix.TCSA.NOW), &term_settings);
+
+    var fds = [_]std.posix.pollfd{
+        .{
+            .fd = stream.handle,
+            .events = std.posix.POLL.IN
+            // | std.posix.POLL.RDHUP
+            ,
+            .revents = 0,
+        },
+        .{ .fd = stdin.handle, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+
+    while (true) {
+        _ = std.posix.poll(&fds, -1) catch break;
+
+        var buf: [1024]u8 = undefined;
+        if (fds[0].revents == std.posix.POLL.IN) {
+            const n = stream.read(&buf) catch break;
+            if (n == 0) break;
+            _ = stdout.writer().writeAll(buf[0..n]) catch break;
+        }
+        if (fds[1].revents == std.posix.POLL.IN) {
+            const n = std.io.getStdIn().read(&buf) catch break;
+            if (n == 0) break;
+            _ = stream.writer().writeAll(buf[0..n]) catch break;
+        }
+    }
+}
+const BUFFERING = true;
+
+fn bg(alloc: std.mem.Allocator, argv: []const []const u8) !void {
+    // std.posix.send()
+    var stream = try std.net.connectUnixSocket(rpc.SOCKET);
+    defer stream.close();
+
+    var args = std.ArrayList(u8).init(alloc);
+    defer args.deinit();
+    for (argv) |arg| {
+        try args.appendSlice(arg);
+        try args.append(' ');
+    }
+
+    if (BUFFERING) {
+        // == Bufffering
+        //
+        const cmd = try args.toOwnedSlice();
+        defer alloc.free(cmd);
+        try std.json.stringify(rpc.ServerMsg{ .bg = cmd }, .{}, args.writer());
+        return stream.writeAll(args.items) catch |err| sendError(err);
+    } else {
+        // == No Bufffering
+        //
+        return std.json.stringify(rpc.ServerMsg{ .bg = args.items }, .{}, stream.writer()) catch |err| sendError(err);
+    }
+}
+
+fn sendError(err: anyerror) !void {
+    switch (err) {
+        error.BrokenPipe => {
+            std.log.warn("server disconnected before sending msg", .{});
+            return;
+        },
+        else => |e| return e,
+    }
+}
+
+fn kill(alloc: std.mem.Allocator, id: usize) !void {
+    _ = alloc;
+
+    var stream = try std.net.connectUnixSocket(rpc.SOCKET);
+    defer stream.close();
+
+    try std.json.stringify(.{ .kill = id }, .{}, stream.writer());
+}
+
+const Args = union(enum) {
+    server,
+    fg: usize,
+    bg: []const []const u8,
+    kill: usize,
+    help,
+
+    pub fn init(alloc: std.mem.Allocator) !Args {
+        const argv = try std.process.argsAlloc(alloc);
+        defer std.process.argsFree(alloc, argv);
+
+        if (argv.len < 2) return .help;
+
+        if (std.mem.eql(u8, argv[1], "server")) {
+            return .server;
+        }
+        if (argv.len < 3) return .help;
+
+        if (std.mem.eql(u8, argv[1], "fg")) {
+            const id = std.fmt.parseInt(usize, argv[2], 10) catch return .help;
+            return .{ .fg = id };
+        }
+
+        if (std.mem.eql(u8, argv[1], "bg")) {
+            var args = std.ArrayList([]const u8).init(alloc);
+            defer args.deinit();
+
+            for (argv[2..]) |arg| {
+                const a = try alloc.dupe(u8, arg);
+                try args.append(a);
+            }
+
+            return .{ .bg = try args.toOwnedSlice() };
+        }
+
+        if (std.mem.eql(u8, argv[1], "kill")) {
+            const id = std.fmt.parseInt(usize, argv[2], 10) catch return .help;
+            return .{ .kill = id };
+        }
+
+        return .help;
+    }
+
+    pub fn deinit(self: Args, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .bg => |argv| {
+                for (argv) |arg| alloc.free(arg);
+                alloc.free(argv);
+            },
+            else => {},
+        }
+    }
+};
